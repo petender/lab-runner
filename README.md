@@ -213,6 +213,83 @@ before the next approved cloud run.
 Commands are serialized by a local operation lock. After an unclean termination,
 inspect for an active runner before removing only `.runner\operation.lock`.
 
+## Copilot lab token usage
+
+For labs teaching Copilot, validate the learner-facing interaction as well as
+the generated code. A successful SDK/CLI replay is not proof that VS Code
+Ask/Agent, `#codebase`, inline chat, completions, or editor actions work.
+Record unexecuted UI steps as manual/unverified.
+
+The runner can import token telemetry into an existing prepared run:
+
+```powershell
+python .\lab_runner.py usage-import --root 'C:\lab-runs\unique-run' `
+  --usage-file 'C:\local-exports\student-session.json' `
+  --session 'student-attempt-01' --step 'Task 2 - Explain code' --usage-scope lab
+```
+
+Capture a dedicated **student** session, not the orchestrating lab-runner
+conversation. The required `--usage-scope` flag distinguishes:
+
+- `lab`: student-facing Copilot interactions specified by the lab.
+- `runner`: Copilot orchestration, preparation, debugging, and validation
+  performed to run the lab tests, rather than interactions prescribed to students.
+
+Import runner telemetry separately with `--usage-scope runner`. Reports show
+separate sections and totals; they never add runner overhead to student usage.
+An absent category is NOT RECORDED, not zero. Legacy imports without a scope
+remain unclassified and excluded from both categories. The same trace/span
+cannot be imported into both categories. Use dedicated sessions: a mixed
+orchestrator/student session cannot be accurately separated by labeling the
+entire export. Scope labels are operator assertions, not automatic detection.
+Estimating overhead per lab also requires a dedicated runner session for that
+lab; do not charge an entire multi-lab orchestration session to every lab.
+
+In supported VS Code versions, enable Agent Debug Logs before
+running the exercise and export the session as OpenTelemetry JSON. See
+[VS Code chat diagnostics](https://code.visualstudio.com/docs/agents/agent-troubleshooting/chat-debug-view).
+Logging is not retroactive. The runner does not change editor settings, drive
+the Chat UI, or automatically discover/export sessions.
+
+### Supported telemetry and limitations
+
+- Imports accept OTLP JSON `resourceSpans[].scopeSpans[].spans[]` with
+  `gen_ai.usage.input_tokens` and `gen_ai.usage.output_tokens` integer attributes.
+  Model grouping prefers `gen_ai.response.model`, then `gen_ai.request.model`.
+  Optional `gen_ai.usage.cache_read.input_tokens` and
+  `gen_ai.usage.cache_creation.input_tokens` are reported separately, not added
+  to input counts.
+- This is an explicit supported interchange format, **not a claim that every
+  VS Code version exports those attributes**. Unsupported exports fail
+  explicitly. A real export must be checked before claiming end-to-end capture.
+- Each model-request span counts once, including retries or agent/tool-loop
+  requests when exported. Duplicate spans within an export are deduplicated;
+  conflicting duplicates and overlapping subsequent exports are rejected.
+  One student prompt can result in multiple model requests.
+- Missing counts are **unknown**, not zero. Inline completions, server-side
+  activity, subagents, or failed requests absent from the export are not
+  measured. The report cannot certify complete session coverage.
+- Each import is labeled with its usage scope, lab step, and session identifier.
+  Export nonoverlapping sessions per task for task attribution; a whole-session
+  export must be labeled as a whole lab, not attributed to just one prompt.
+- Only allowlisted model names, span IDs, counts, labels, export SHA-256 and
+  import time persist in `.runner\copilot-usage.json`. Raw prompts, source code,
+  tool payloads, and export paths are not copied. Raw exports can contain
+  sensitive content: keep them local and out of Git. Do not put secrets in
+  model/step/session labels.
+
+The Markdown report distinguishes recorded input/output and cache counts from
+unknown counts. These are telemetry measurements, **not billing units, premium
+requests, or a dollar estimate**. No billing conversion is inferred.
+
+For a student-usage estimate, repeat a fixed lab script in fresh clones and fresh
+student chats, recording VS Code/Copilot versions, selected and resolved model
+(especially for Auto), mode, context attachments, and retry policy. Compare
+per-attempt totals and report a range/median only for comparable, sufficiently
+covered attempts. A single run or prompt-text tokenization alone cannot predict
+the hidden context, tool loops, model output, or variability of a student's lab.
+This statistical estimation and VS Code UI execution are not yet automated.
+
 ## Tests
 
 ```powershell

@@ -17,6 +17,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
+from copilot_usage import extract_requests, summarize
+
 
 HOME = Path(__file__).resolve().parent
 DATA = HOME / ".runner"
@@ -132,6 +134,45 @@ def render_report(root: Path) -> Path:
         lines.append(f"- [{cell(relative)}]({link}): {cell(json.dumps(record))}")
     if not state.get("evidence"):
         lines.append("No validated evidence recorded.")
+    usage_path = root / ".runner" / "copilot-usage.json"
+    if usage_path.exists():
+        usage = read(usage_path)
+        lines += ["", "## Copilot usage (imported telemetry)", "",
+                  "Recorded tokens are not billing units, premium requests, or a student-cost estimate.",
+                  "Lab-step usage and lab-runner overhead are reported separately, never combined. "
+                  "Unexported calls and unsupported events are unknown. "
+                  "Classification is supplied by the importer, not inferred from prompts.",
+                  "Cache counts are separate details; do not add them to input totals.", "",
+                  "Only dedicated, nonmixed sessions can be attributed to either category."]
+        for scope, label in (
+            ("lab", "Actual lab steps (student-facing Copilot)"),
+            ("runner", "Lab-runner overhead (orchestration and validation)"),
+            ("unclassified", "Unclassified historical imports (excluded from both categories)"),
+        ):
+            records = [item for item in usage["requests"]
+                       if item.get("usage_scope", "unclassified") == scope]
+            if scope == "unclassified" and not records:
+                continue
+            lines += ["", f"### {label}", ""]
+            if not records:
+                lines.append("NOT RECORDED (unknown, not zero).")
+                continue
+            lines += ["| Model | Recorded requests | Input tokens | Output tokens | "
+                      "Cache-read tokens | Cache-creation tokens |",
+                      "|---|---|---|---|---|---|"]
+            for model, totals in summarize(records).items():
+                values = []
+                for field in ("input_tokens", "output_tokens", "cache_read_tokens",
+                              "cache_creation_tokens"):
+                    count = totals[field]
+                    values.append(f"{count['recorded']} recorded; {count['missing']} unknown")
+                lines.append(f"| {cell(model)} | {totals['requests']} | " + " | ".join(values) + " |")
+        lines += ["", "### Usage imports", ""]
+        for entry in usage["imports"]:
+            lines.append(f"- Scope **{cell(entry.get('usage_scope', 'unclassified'))}**, "
+                         f"step **{cell(entry['step'])}**, session **{cell(entry['session'])}**; "
+                         f"SHA-256 `{entry['sha256']}`; "
+                         f"{entry['missing_usage']} request spans missing input/output counts.")
     lines += ["", "## Manual / unverified checks", ""]
     for check in manifest.get("manual_checks", []):
         lines.append(f"- [ ] {cell(check)}")
@@ -525,6 +566,40 @@ def lifecycle(args: argparse.Namespace) -> None:
     print("Automated lifecycle PASS. Review any manifest manual checks separately.")
 
 
+def import_copilot_usage(args: argparse.Namespace) -> None:
+    root = args.root.resolve()
+    # Require a prepared run; usage import must not create an unrelated run directory.
+    load_manifest(root / ".runner" / "manifest.json")
+    read(root / ".runner" / "state.json")
+    if not args.step.strip() or not args.session.strip():
+        raise ValueError("Usage imports require nonempty step and session labels.")
+    if args.usage_scope not in ("lab", "runner"):
+        raise ValueError("Usage scope must explicitly be lab or runner.")
+    content = args.usage_file.read_bytes()
+    requests, missing = extract_requests(json.loads(content))
+    path = root / ".runner" / "copilot-usage.json"
+    usage = read(path) if path.exists() else {"version": 1, "requests": [], "imports": []}
+    digest = hashlib.sha256(content).hexdigest()
+    if any(entry["sha256"] == digest for entry in usage["imports"]):
+        raise ValueError("This export has already been imported.")
+    identities = {(item["trace_id"], item["span_id"]) for item in usage["requests"]}
+    if any((item["trace_id"], item["span_id"]) in identities for item in requests):
+        raise ValueError("Export overlaps previously imported spans; use nonoverlapping exports.")
+    usage["requests"].extend(
+        {**item, "step": args.step, "session": args.session,
+         "usage_scope": args.usage_scope} for item in requests
+    )
+    usage["imports"].append({
+        "step": args.step, "session": args.session, "sha256": digest,
+        "usage_scope": args.usage_scope,
+        "missing_usage": missing, "imported": datetime.now(timezone.utc).isoformat(),
+    })
+    write(path, usage)
+    print(render_report(root))
+    print(f"Imported {len(requests)} request spans; {missing} missing token counts. "
+          "Raw prompts, code, tool payloads and export paths were not copied.")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="action", required=True)
@@ -547,7 +622,13 @@ def main() -> int:
     run = commands.add_parser("run")
     run.add_argument("--approve", required=True)
     report = commands.add_parser("report")
-    for item in (prep, planning, run, report):
+    usage = commands.add_parser("usage-import", help="Import scoped Copilot OTLP token telemetry")
+    usage.add_argument("--usage-file", type=Path, required=True)
+    usage.add_argument("--step", required=True)
+    usage.add_argument("--session", required=True)
+    usage.add_argument("--usage-scope", choices=("lab", "runner"), required=True,
+                       help="Separate actual lab interactions from runner orchestration overhead")
+    for item in (prep, planning, run, report, usage):
         item.add_argument("--root", type=Path, required=True)
     args = parser.parse_args()
     lock = DATA / "operation.lock"
@@ -558,6 +639,8 @@ def main() -> int:
             acquired = True
         if args.action == "check":
             prerequisite_check(args.python, args.azure)
+        elif args.action == "usage-import":
+            import_copilot_usage(args)
         elif args.action == "cycle":
             path = DATA / "cycle.json"
             if path.exists() and not args.replace:
