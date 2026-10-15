@@ -1,0 +1,12 @@
+{
+  "folders": [
+    {
+      "name": "Lab Runner",
+      "path": "."
+    },
+    {
+      "name": "Lab Runs",
+      "path": "..\\lab-runs"
+    }
+  ]
+}

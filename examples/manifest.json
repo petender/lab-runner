@@ -13,5 +13,14 @@
     ["{python}", "-m", "py_compile", "solution.py"],
     ["{python}", "-c", "from solution import answer; assert answer() == 42"]
   ],
+  "reporting": {
+    "title": "Synthetic learner lab execution",
+    "steps": {
+      "compose": {"task": "Task 1", "label": "Complete answer snippet"},
+      "venv": {"task": "Task 2", "label": "Create Python virtual environment"},
+      "local-1": {"task": "Task 3, step 1", "label": "Compile completed solution"},
+      "local-2": {"task": "Task 3, step 2", "label": "Verify answer equals 42"}
+    }
+  },
   "manual_checks": ["No cloud infrastructure is included in this synthetic example."]
 }

@@ -85,6 +85,60 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(runner.read(target / ".runner" / "state.json")["local"], "passed")
         self.assertIn("raise NotImplementedError", (source / "solution.py").read_text())
         self.assertIn("return 42", (target / "solution.py").read_text())
+        results = runner.read(target / ".runner" / "results.json")
+        for key in ("compose", "venv", "dependency-check", "local-1", "local-2"):
+            self.assertEqual(results[key]["status"], "passed")
+            self.assertLessEqual(results[key]["started"], results[key]["finished"])
+        report = (target / ".runner" / "report.md").read_text()
+        self.assertIn("Task 3, step 2", report)
+        self.assertIn("[log](logs/local-2.log)", report)
+        self.assertIn("**PASSED**", report)
+
+    def test_report_records_failure_and_unexecuted_steps(self):
+        manifest = {
+            "version": 1, "working_directory": ".",
+            "local": [[sys.executable, "-c", "exit(7)"], [sys.executable, "-V"]],
+            "manual_checks": ["Inspect portal | traces"],
+        }
+        runner.write(self.root / ".runner" / "manifest.json", manifest)
+        runner.write(self.root / ".runner" / "state.json", {"local": "running"})
+        with self.assertRaisesRegex(RuntimeError, "failed \\(7\\)"):
+            runner.run_commands(self.root, manifest, "local")
+        report = (self.root / ".runner" / "report.md").read_text()
+        self.assertIn("| local-1 | Unmapped | Local command 1 | FAILED |", report)
+        self.assertIn("| local-2 | Unmapped | Local command 2 | NOT RUN |", report)
+        self.assertIn("- [ ] Inspect portal \\| traces", report)
+        self.assertIn("Command failed (7)", report)
+
+    def test_reporting_rejects_invalid_mapping(self):
+        path = self.root / "manifest.json"
+        for mapping in ({"live-1": {"task": "Not declared"}},
+                        {"venv": {"task": 1}},
+                        {"venv": {"unknown": "value"}}):
+            runner.write(path, {"version": 1, "working_directory": ".", "local": [],
+                                "reporting": {"steps": mapping}})
+            with self.assertRaises(ValueError):
+                runner.load_manifest(path)
+
+    def test_historical_report_does_not_invent_steps(self):
+        runner.write(self.root / ".runner" / "manifest.json", {
+            "working_directory": ".", "local": [[sys.executable, "-V"]],
+        })
+        runner.write(self.root / ".runner" / "state.json", {
+            "local": "passed", "phases": {"preview": "passed", "cleanup": "passed"},
+        })
+        report = runner.render_report(self.root).read_text()
+        self.assertIn("NOT RECORDED", report)
+        self.assertNotIn("| Local command 1 | PASSED |", report)
+        self.assertIn("- cleanup: **PASSED**", report)
+
+    def test_interrupted_step_is_failed(self):
+        with self.assertRaises(KeyboardInterrupt):
+            with runner.recorded_step(self.root, "venv"):
+                raise KeyboardInterrupt
+        result = runner.read(self.root / ".runner" / "results.json")["venv"]
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["error"], "Interrupted by operator.")
 
 
 class LifecycleTests(unittest.TestCase):
@@ -152,6 +206,13 @@ class LifecycleTests(unittest.TestCase):
         state = runner.read(self.root / ".runner" / "state.json")
         self.assertEqual(state["lifecycle"], "passed")
         self.assertEqual(state["phases"]["cleanup"], "passed")
+        results = runner.read(self.root / ".runner" / "results.json")
+        for key in ("env-new", "env-settings", "group-create", "preview", "provision",
+                    "outputs", "evidence", "cleanup"):
+            self.assertEqual(results[key]["status"], "passed")
+        report = (self.root / ".runner" / "report.md").read_text()
+        self.assertNotIn("approved", report)
+        self.assertNotIn("https://example.invalid", report)
 
     def test_existing_group_never_deleted(self):
         self.group_exists = True
@@ -181,6 +242,12 @@ class LifecycleTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "provision failure"):
                 runner.lifecycle(self.args)
         self.assertFalse(self.group_exists)
+        results = runner.read(self.root / ".runner" / "results.json")
+        self.assertEqual(results["provision"]["status"], "failed")
+        self.assertEqual(results["cleanup"]["status"], "passed")
+        report = (self.root / ".runner" / "report.md").read_text()
+        self.assertIn("provision failure", report)
+        self.assertIn("| Live command 1 | NOT RUN |", report)
 
     def test_ownership_mismatch_prevents_cleanup(self):
         def mismatch(args, *other, **kwargs):
@@ -191,6 +258,9 @@ class LifecycleTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "Ownership tag mismatch"):
                 runner.lifecycle(self.args)
         self.assertTrue(self.group_exists)
+        report = (self.root / ".runner" / "report.md").read_text()
+        self.assertIn("CLEANUP FAILED", report)
+        self.assertIn("Resources may remain billable in rg-new", report)
 
 
 if __name__ == "__main__":

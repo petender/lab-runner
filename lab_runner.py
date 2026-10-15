@@ -11,9 +11,11 @@ import shutil
 import subprocess
 import sys
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 
 HOME = Path(__file__).resolve().parent
@@ -29,6 +31,149 @@ def write(path: Path, value: Any) -> None:
     temporary = path.with_suffix(".tmp")
     temporary.write_text(json.dumps(value, indent=2), encoding="utf-8")
     temporary.replace(path)
+
+
+def report_steps(manifest: dict) -> dict[str, str]:
+    steps = {}
+    if manifest.get("compose"):
+        steps["compose"] = "Copy instruction snippets"
+    steps["venv"] = "Create isolated Python virtual environment"
+    if manifest.get("requirements"):
+        steps["dependencies"] = "Install declared dependencies"
+    steps["dependency-check"] = "Check installed dependency compatibility"
+    for index in range(1, len(manifest.get("local", [])) + 1):
+        steps[f"local-{index}"] = f"Local command {index}"
+    if manifest.get("azure"):
+        steps.update({
+            "env-new": "Create azd environment",
+            "env-settings": "Configure azd inputs",
+            "group-create": "Create dedicated resource group",
+            "preview": "Preview infrastructure",
+            "provision": "Provision infrastructure",
+            "outputs": "Load allowlisted deployment outputs",
+        })
+        for index in range(1, len(manifest.get("live", [])) + 1):
+            steps[f"live-{index}"] = f"Live command {index}"
+        steps["evidence"] = "Validate acceptance evidence"
+        steps["cleanup"] = "Purge environment and verify resource group absence"
+    return steps
+
+
+def render_report(root: Path) -> Path:
+    manifest = read(root / ".runner" / "manifest.json")
+    state = read(root / ".runner" / "state.json")
+    results_path = root / ".runner" / "results.json"
+    results = read(results_path) if results_path.exists() else {}
+    reporting = manifest.get("reporting", {})
+
+    def cell(value: Any) -> str:
+        return (str(value).replace("&", "&amp;").replace("<", "&lt;")
+                .replace(">", "&gt;").replace("|", "\\|")
+                .replace("`", "\\`").replace("\r", "").replace("\n", "<br>"))
+
+    lines = [
+        f"# {cell(reporting.get('title', 'Lab execution report'))}", "",
+        f"- Generated (UTC): {datetime.now(timezone.utc).isoformat()}",
+        f"- Source: {cell(state.get('source', 'Not recorded'))}",
+        f"- Source commit: {cell(state.get('commit', 'Not recorded'))}",
+        f"- Disposable clone: {cell(root)}",
+        f"- Local preparation: **{cell(state.get('local', 'not run')).upper()}**",
+        f"- Cloud lifecycle: **{cell(state.get('lifecycle', 'not run')).upper()}**",
+    ]
+    target = state.get("target", {})
+    if target:
+        cycle = target["cycle"]
+        for label, value in (
+            ("Subscription", cycle["subscription"]), ("Tenant", cycle["tenant"]),
+            ("Region", target["location"]), ("Resource group", target["group"]),
+            ("azd environment", target["environment"]),
+        ):
+            lines.append(f"- {label}: {cell(value)}")
+    lines += ["", "PASS means only the named automated operation succeeded, not full lab acceptance.",
+              "NOT RUN means no recorded execution; RUNNING may indicate an interrupted process.",
+              "", "## Steps", "",
+              "| Step ID | Lab task / step | Operation | Status | Started / finished (UTC) | Command / details | Log |",
+              "|---|---|---|---|---|---|---|"]
+    for key, default_label in report_steps(manifest).items():
+        mapping = reporting.get("steps", {}).get(key, {})
+        result = results.get(key, {})
+        status = result.get("status", "not run" if results_path.exists() else "not recorded").upper()
+        timing = " / ".join(result.get(name, "-") for name in ("started", "finished"))
+        details = result.get("command", "")
+        if result.get("error"):
+            details += "\n" + result["error"]
+        log = result.get("log")
+        link = f"[log]({quote(Path(log).as_posix())})" if log and (
+            root / ".runner" / log
+        ).is_file() else "-"
+        lines.append(
+            f"| {cell(key)} | {cell(mapping.get('task', 'Unmapped'))} | "
+            f"{cell(mapping.get('label', default_label))} | {status} | {cell(timing)} | "
+            f"{cell(details)} | {link} |"
+        )
+    if not results:
+        lines += ["", "### Historical run", "",
+                  "This run predates step recording. Individual steps above are NOT RECORDED,",
+                  "not evidence of failure. Only the persisted phase outcomes below are known.",
+                  "No command timestamps or individual results have been inferred from log presence.", ""]
+        # Older state files only persisted successful phases.
+        for name, status in state.get("phases", {}).items():
+            lines.append(f"- {cell(name)}: **{cell(status).upper()}**")
+    if state.get("error") or state.get("errors"):
+        lines += ["", "## Issues", ""]
+        for error in ([state["error"]] if state.get("error") else []) + state.get("errors", []):
+            lines.append(f"- {cell(error)}")
+    if target and state.get("phases", {}).get("cleanup") != "passed":
+        lines += ["", "**Cleanup has not been verified. Resources may remain billable in "
+                  f"{cell(target['group'])} ({cell(target['cycle']['subscription'])}).**"]
+    lines += ["", "## Acceptance evidence", ""]
+    for relative, record in state.get("evidence", {}).items():
+        link = quote("../" + relative.replace("\\", "/"))
+        lines.append(f"- [{cell(relative)}]({link}): {cell(json.dumps(record))}")
+    if not state.get("evidence"):
+        lines.append("No validated evidence recorded.")
+    lines += ["", "## Manual / unverified checks", ""]
+    for check in manifest.get("manual_checks", []):
+        lines.append(f"- [ ] {cell(check)}")
+    if not manifest.get("manual_checks"):
+        lines.append("No manual checks declared; this does not establish semantic acceptance.")
+    path = root / ".runner" / "report.md"
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    temporary.replace(path)
+    return path
+
+
+@contextmanager
+def recorded_step(root: Path, key: str, description: str = "", log: Path | None = None):
+    path = root / ".runner" / "results.json"
+    results = read(path) if path.exists() else {}
+    entry = {"status": "running", "started": datetime.now(timezone.utc).isoformat(),
+             "command": description}
+    if log:
+        entry["log"] = str(log.relative_to(root / ".runner"))
+    results[key] = entry
+    write(path, results)
+    if (root / ".runner" / "manifest.json").exists():
+        render_report(root)
+    try:
+        yield
+    except (OSError, RuntimeError, ValueError, KeyError, IndexError, KeyboardInterrupt) as exc:
+        entry.update(status="failed", error=str(exc) or "Interrupted by operator.")
+        raise
+    else:
+        entry["status"] = "passed"
+    finally:
+        entry["finished"] = datetime.now(timezone.utc).isoformat()
+        write(path, results)
+        if (root / ".runner" / "manifest.json").exists():
+            render_report(root)
+
+
+def recorded_command(root: Path, key: str, args: list[str], cwd: Path,
+                     log: Path, environment: dict | None = None) -> str:
+    with recorded_step(root, key, subprocess.list2cmdline(args), log):
+        return command(args, cwd, log, environment)
 
 
 def inside(root: Path, relative: str) -> Path:
@@ -112,6 +257,19 @@ def load_manifest(path: Path) -> dict:
                 isinstance(arg, str) for arg in args
             ):
                 raise ValueError(f"{phase} commands must be nonempty string argument arrays.")
+    reporting = manifest.get("reporting", {})
+    if not isinstance(reporting, dict) or not isinstance(reporting.get("title", ""), str):
+        raise ValueError("reporting must be an object with an optional string title.")
+    mappings = reporting.get("steps", {})
+    if not isinstance(mappings, dict):
+        raise ValueError("reporting.steps must be an object.")
+    for key, mapping in mappings.items():
+        if key not in report_steps(manifest):
+            raise ValueError(f"Unknown reporting step: {key}")
+        if not isinstance(mapping, dict) or any(
+            not isinstance(value, str) for value in mapping.values()
+        ) or any(name not in ("task", "label") for name in mapping):
+            raise ValueError("Each reporting step supports string task and label fields.")
     return manifest
 
 
@@ -120,7 +278,8 @@ def run_commands(root: Path, manifest: dict, phase: str, env: dict | None = None
     python = root / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
     for index, args in enumerate(manifest.get(phase, []), 1):
         rendered = [arg.replace("{python}", str(python)) for arg in args]
-        command(rendered, work, root / ".runner" / "logs" / f"{phase}-{index}.log", env)
+        recorded_command(root, f"{phase}-{index}", rendered, work,
+                         root / ".runner" / "logs" / f"{phase}-{index}.log", env)
 
 
 def compose(root: Path, manifest: dict) -> None:
@@ -152,25 +311,33 @@ def prepare(args: argparse.Namespace) -> None:
         "source": str(source), "commit": commit, "local": "running",
     })
     write(root / ".runner" / "manifest.json", manifest)
+    logdir = root / ".runner" / "logs"
     try:
-        compose(root, manifest)
-        command([str(args.python.resolve()), "-m", "venv", str(root / ".venv")], root)
+        if manifest.get("compose"):
+            with recorded_step(root, "compose"):
+                compose(root, manifest)
+        recorded_command(root, "venv",
+                         [str(args.python.resolve()), "-m", "venv", str(root / ".venv")],
+                         root, logdir / "venv.log")
         python = root / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
         requirements = manifest.get("requirements")
         if requirements:
-            command([str(python), "-m", "pip", "install", "-r",
-                     str(inside(root, requirements))], root,
-                    root / ".runner" / "logs" / "dependencies.log")
-        command([str(python), "-m", "pip", "check"], root)
+            recorded_command(root, "dependencies", [str(python), "-m", "pip", "install", "-r",
+                             str(inside(root, requirements))], root, logdir / "dependencies.log")
+        recorded_command(root, "dependency-check", [str(python), "-m", "pip", "check"],
+                         root, logdir / "dependency-check.log")
         run_commands(root, manifest, "local")
-    except (OSError, RuntimeError, ValueError, IndexError) as exc:
+    except (OSError, RuntimeError, ValueError, KeyError, IndexError, KeyboardInterrupt) as exc:
         write(root / ".runner" / "state.json", {
-            "source": str(source), "commit": commit, "local": "failed", "error": str(exc),
+            "source": str(source), "commit": commit, "local": "failed",
+            "error": str(exc) or "Interrupted by operator.",
         })
+        render_report(root)
         raise
     write(root / ".runner" / "state.json", {
         "source": str(source), "commit": commit, "local": "passed",
     })
+    render_report(root)
     print(f"Local PASS: {root}")
 
 
@@ -287,35 +454,45 @@ def lifecycle(args: argparse.Namespace) -> None:
                        private=private)
 
     try:
-        azd("env", "new", approval["environment"], "--subscription", subscription,
-            "--location", approval["location"], "--no-prompt")
+        with recorded_step(root, "env-new", "azd env new --no-prompt",
+                           logdir / "azd-env-new.log"):
+            azd("env", "new", approval["environment"], "--subscription", subscription,
+                "--location", approval["location"], "--no-prompt")
         values = {
             **manifest["azure"].get("values", {}),
             "AZURE_SUBSCRIPTION_ID": subscription,
             "AZURE_LOCATION": approval["location"], "AZURE_RESOURCE_GROUP": group,
         }
-        for key, value in values.items():
-            azd("env", "set", key, str(value), private=True)
+        with recorded_step(root, "env-settings", "azd env set (values withheld)"):
+            for key, value in values.items():
+                azd("env", "set", key, str(value), private=True)
         # What-if can require an existing resource group.
         owned = True
-        az("group", "create", "-n", group, "-l", approval["location"],
-           "--tags", f"labRunnerApproval={approval['token']}", "-o", "none")
-        azd("provision", "--preview", "--no-prompt")
+        with recorded_step(root, "group-create", "az group create (ownership tag withheld)"):
+            az("group", "create", "-n", group, "-l", approval["location"],
+               "--tags", f"labRunnerApproval={approval['token']}", "-o", "none")
+        with recorded_step(root, "preview", "azd provision --preview --no-prompt",
+                           logdir / "azd-provision---preview.log"):
+            azd("provision", "--preview", "--no-prompt")
         state["phases"]["preview"] = "passed"
-        azd("provision", "--no-prompt")
+        with recorded_step(root, "provision", "azd provision --no-prompt",
+                           logdir / "azd-provision---no-prompt.log"):
+            azd("provision", "--no-prompt")
         state["phases"]["provision"] = "passed"
-        outputs = json.loads(azd("env", "get-values", "--output", "json", private=True))
-        env = {}
-        for key in manifest["azure"].get("export", []):
-            if key not in outputs or not isinstance(outputs[key], str) or not outputs[key]:
-                raise ValueError(f"Missing deployment output: {key}")
-            env[key] = outputs[key]
+        with recorded_step(root, "outputs", "azd env get-values (output withheld)"):
+            outputs = json.loads(azd("env", "get-values", "--output", "json", private=True))
+            env = {}
+            for key in manifest["azure"].get("export", []):
+                if key not in outputs or not isinstance(outputs[key], str) or not outputs[key]:
+                    raise ValueError(f"Missing deployment output: {key}")
+                env[key] = outputs[key]
         # Old files cannot satisfy evidence requirements for this execution.
         for entry in manifest["evidence"]:
             if inside(root, entry["path"]).exists():
                 raise ValueError("Evidence already exists before live run; use a fresh clone.")
         run_commands(root, manifest, "live", env)
-        state["evidence"] = validate_evidence(root, manifest)
+        with recorded_step(root, "evidence"):
+            state["evidence"] = validate_evidence(root, manifest)
         state["phases"]["live"] = "passed"
     except (OSError, RuntimeError, ValueError, KeyError) as exc:
         errors.append(str(exc))
@@ -324,20 +501,25 @@ def lifecycle(args: argparse.Namespace) -> None:
     finally:
         if owned:
             try:
-                if az("group", "exists", "-n", group).lower() == "true":
-                    tag = az("group", "show", "-n", group, "--query",
-                             "tags.labRunnerApproval", "-o", "tsv")
-                    if tag != approval["token"]:
-                        raise ValueError("Ownership tag mismatch; refusing deletion.")
-                    azd("down", "--purge", "--force", "--no-prompt")
-                if az("group", "exists", "-n", group).lower() != "false":
-                    raise ValueError("Resource group still exists.")
+                with recorded_step(root, "cleanup",
+                                   "Verify ownership; if group exists, "
+                                   "azd down --purge --force --no-prompt; "
+                                   "verify resource group absence", logdir / "azd-down---purge.log"):
+                    if az("group", "exists", "-n", group).lower() == "true":
+                        tag = az("group", "show", "-n", group, "--query",
+                                 "tags.labRunnerApproval", "-o", "tsv")
+                        if tag != approval["token"]:
+                            raise ValueError("Ownership tag mismatch; refusing deletion.")
+                        azd("down", "--purge", "--force", "--no-prompt")
+                    if az("group", "exists", "-n", group).lower() != "false":
+                        raise ValueError("Resource group still exists.")
                 state["phases"]["cleanup"] = "passed"
             except (OSError, RuntimeError, ValueError) as exc:
                 errors.append(f"CLEANUP FAILED: {exc}; resources may remain billable.")
         state.update(lifecycle="failed" if errors else "passed", errors=errors,
                      manual_checks=manifest.get("manual_checks", []))
         write(root / ".runner" / "state.json", state)
+        render_report(root)
     if errors:
         raise RuntimeError("; ".join(errors))
     print("Automated lifecycle PASS. Review any manifest manual checks separately.")
@@ -364,7 +546,8 @@ def main() -> int:
         planning.add_argument("--" + name, required=True)
     run = commands.add_parser("run")
     run.add_argument("--approve", required=True)
-    for item in (prep, planning, run):
+    report = commands.add_parser("report")
+    for item in (prep, planning, run, report):
         item.add_argument("--root", type=Path, required=True)
     args = parser.parse_args()
     lock = DATA / "operation.lock"
@@ -394,7 +577,10 @@ def main() -> int:
                          "subscription": active["id"], "tenant": active["tenantId"]})
             print("Cycle saved; Azure credentials remain in the CLI credential stores.")
         else:
-            {"prepare": prepare, "plan": plan, "run": lifecycle}[args.action](args)
+            if args.action == "report":
+                print(render_report(args.root.resolve()))
+            else:
+                {"prepare": prepare, "plan": plan, "run": lifecycle}[args.action](args)
     except (OSError, RuntimeError, ValueError, KeyError, IndexError,
             subprocess.CalledProcessError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

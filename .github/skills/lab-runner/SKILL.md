@@ -8,6 +8,31 @@ description: 'Run any trusted manifest-driven learner lab: discover sources, pre
 Read the workspace README and `lab_runner.py`. Execute the runner rather than
 asking the user to copy/paste lab commands. Never edit the source repository.
 
+## Workspace visibility
+
+Before preparing the first lab in a testing session, ensure the shared runs parent
+is visible alongside the runner in the current VS Code window. Default to
+`C:\lab-runs` on this Windows setup unless the user chose another location.
+Create the parent directory if needed; each disposable clone must still use a NEW
+child directory outside the lab source repository.
+
+If the parent is not already a workspace folder, run
+`code --reuse-window --add 'C:\lab-runs'` using the actual selected parent path.
+Add the parent once, not every clone: future runs, reports, logs and evidence then
+appear automatically. Preserve existing workspace folders. Do not launch another
+VS Code instance, switch workspaces, or overwrite the user's workspace file.
+The repository's `lab-runner.code-workspace` is an optional reusable layout.
+
+If workspace inspection is unavailable, issue the add command at most once per
+testing session; VS Code deduplicates existing folders. If the `code` CLI is
+unavailable or adding the folder fails, report that limitation explicitly and
+offer the supplied workspace file or **File > Add Folder to Workspace**.
+Do not claim the Explorer update was verified solely from the CLI exit code;
+verify workspace folders when tools permit, otherwise state that the request
+was sent to VS Code. Folder visibility does not grant cloud lifecycle consent.
+
+## Lab execution
+
 1. Ask for the lab source location and manifest. Accept an instruction folder,
    normalize to its Git repository root, and inspect the instructions and code.
    Do not assume a particular lab layout, model, API, or service. A source location
