@@ -1,0 +1,2 @@
+def answer():
+    raise NotImplementedError

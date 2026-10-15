@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "working_directory": ".",
+  "compose": [
+    {
+      "target": "solution.py",
+      "instructions": "instructions.md",
+      "block": 0,
+      "placeholder": "raise NotImplementedError"
+    }
+  ],
+  "local": [
+    ["{python}", "-m", "py_compile", "solution.py"],
+    ["{python}", "-c", "from solution import answer; assert answer() == 42"]
+  ],
+  "manual_checks": ["No cloud infrastructure is included in this synthetic example."]
+}
